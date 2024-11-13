@@ -1,28 +1,29 @@
-import os
 import gc
-import torch
+import os
+
 import librosa
 import numpy as np
 import soundfile as sf
+import torch
 from fairseq import checkpoint_utils
 from pydub import AudioSegment
 from scipy.io import wavfile
-import asyncio
-import edge_tts
-import gradio as gr
 
-from rvc.lib.algorithm.synthesizers import Synthesizer
-from rvc.lib.my_utils import load_audio
 from rvc.infer.config import Config
 from rvc.infer.pipeline import VC
+from rvc.lib.algorithm.synthesizers import Synthesizer
+from rvc.lib.my_utils import load_audio
 
 # Инициализация конфигурации
 config = Config()
 
-# Определение путей к директориям с моделями
+
 RVC_MODELS_DIR = os.path.join(os.getcwd(), "models")
-HUBERT_PATH = os.path.join(os.getcwd(), "rvc", "models", "embedders", "hubert_base.pt")
-OUTPUT_DIR = os.path.join(os.getcwd(), "output", "converted_audio")
+EMBEDDERS_DIR = os.path.join(os.getcwd(), "rvc", "models", "embedders")
+HUBERT_BASE_PATH = os.path.join(EMBEDDERS_DIR, "hubert_base.pt")
+
+os.makedirs(EMBEDDERS_DIR, exist_ok=True)
+os.makedirs(RVC_MODELS_DIR, exist_ok=True)
 
 
 # Загружает модель RVC и индекс по имени модели.
@@ -103,12 +104,6 @@ def get_vc(model_path):
     return cpt, version, net_g, tgt_sr, vc
 
 
-# Функция для синтеза речи с помощью Edge TTS
-async def text_to_speech(text, voice, output_path):
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(output_path)
-
-
 # Конвертирует аудиофайл в стерео формат.
 def convert_to_stereo(input_path, output_path):
     # Загружаем аудиофайл
@@ -125,23 +120,19 @@ def convert_to_stereo(input_path, output_path):
 
 
 # Конвертирует аудиофайл в выбранный пользователем формат.
-def convert_to_user_format(input_path, base_name, output_format):
+def convert_to_user_format(input_path, output_path, output_format):
     # Загружаем аудиофайл
     audio = AudioSegment.from_file(input_path)
-    
-    output_name = os.path.splitext(os.path.basename(base_name))[0]
-    output_path = os.path.join(OUTPUT_DIR, f"{output_name}_(Converted).{output_format}")
 
     # Сохраняем аудиофайл в выбранном формате
     audio.export(output_path, format=output_format)
-    return output_path
 
 
 # Выполняет инференс с использованием RVC
-def infer(
+def rvc_infer(
     voice_model,
     input_path,
-    output_path,
+    output_dir,
     index_rate,
     pitch,
     f0_method,
@@ -154,13 +145,21 @@ def infer(
     output_format,
 ):
     # Загружаем модель Hubert
-    hubert_model = load_hubert(HUBERT_PATH)
+    hubert_model = load_hubert(HUBERT_BASE_PATH)
     # Загружаем модель RVC и индекс
     model_path, index_path = load_rvc_model(voice_model)
     # Получаем конвертер голоса
     cpt, version, net_g, tgt_sr, vc = get_vc(model_path)
     # Загружаем аудиофайл
     audio = load_audio(input_path, 16000)
+
+    # Формируем имя выходного файла
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    temp_output_path = os.path.join(output_dir, f"{base_name}_(Converted).flac")
+    final_output_path = os.path.join(
+        output_dir, f"{base_name}_(Converted).{output_format}"
+    )
+
     # Выполняем конвертацию голоса
     audio_opt = vc.pipeline(
         hubert_model,
@@ -183,20 +182,30 @@ def infer(
         f0_file=None,
     )
     # Сохраняем результат в файл
-    wavfile.write(output_path, tgt_sr, audio_opt)
+    wavfile.write(temp_output_path, tgt_sr, audio_opt)
 
-    # Конвертируем файл в стерео формат
-    convert_to_stereo(output_path, output_path)
+    # Конвертируем файл в стерео формат с использованием scipy
+    convert_to_stereo(temp_output_path, temp_output_path)
+
+    # Конвертируем файл в выбранный пользователем формат
+    convert_to_user_format(temp_output_path, final_output_path, output_format)
+
+    # Удаляем временный файл
+    os.remove(temp_output_path)
 
     # Освобождаем память
     del hubert_model, cpt, net_g, vc
     gc.collect()
     torch.cuda.empty_cache()
 
+    return final_output_path  # Возвращаем путь к выходному файлу
 
-def rvc_infer(
+
+# Выполняет пакетное преобразование файлов с использованием rvc_infer
+def rvc_infer_batch(
     voice_model,
-    input_path,
+    input_dir,
+    output_dir,
     index_rate,
     pitch,
     f0_method,
@@ -207,88 +216,49 @@ def rvc_infer(
     f0_min,
     f0_max,
     output_format,
-    progress=gr.Progress(),
 ):
-    progress(0, "Запуск конвейера генерации...")
+    # Получаем список файлов в директории input_dir
+    input_files = [
+        f
+        for f in os.listdir(input_dir)
+        if f.endswith(
+            (
+                "wav",
+                "mp3",
+                "flac",
+                "ogg",
+                "opus",
+                "m4a",
+                "mp4",
+                "aac",
+                "alac",
+                "wma",
+                "aiff",
+                "webm",
+                "ac3",
+            )
+        )
+    ]
 
-    output_path = os.path.join(OUTPUT_DIR, f"Voice_Converted.wav")
+    for input_file in input_files:
+        # Формируем пути к входному и выходному файлам
+        input_path = os.path.join(input_dir, input_file)
 
-    # Выполняем инференс
-    infer(
-        voice_model,
-        input_path,
-        output_path,
-        index_rate,
-        pitch,
-        f0_method,
-        filter_radius,
-        volume_envelope,
-        protect,
-        hop_length,
-        f0_min,
-        f0_max,
-        output_format,
-    )
+        print(f"Преобразование {input_file}...")
 
-    # Конвертируем файл в выбранный пользователем формат
-    final_output_path = convert_to_user_format(output_path, input_path, output_format)
-
-    # Удаляем временный файл
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
-    progress(1, "Готово!")
-    return final_output_path
-
-
-def tts_infer(
-    voice_model,
-    input_text,
-    index_rate,
-    pitch,
-    f0_method,
-    filter_radius,
-    volume_envelope,
-    protect,
-    hop_length,
-    f0_min,
-    f0_max,
-    output_format,
-    voice,
-    progress=gr.Progress(),
-):
-    progress(0, "Запуск конвейера генерации...")
-
-    # Синтез речи с помощью Edge TTS
-    progress(0.4, "Синтез речи...")
-    tts_voice_path = os.path.join(OUTPUT_DIR, "TTS_Voice.wav")
-    asyncio.run(text_to_speech(input_text, voice, tts_voice_path))
-
-    output_path = os.path.join(OUTPUT_DIR, f"TTS_Voice_Converted.wav")
-
-    # Выполняем инференс
-    infer(
-        voice_model,
-        tts_voice_path,
-        output_path,
-        index_rate,
-        pitch,
-        f0_method,
-        filter_radius,
-        volume_envelope,
-        protect,
-        hop_length,
-        f0_min,
-        f0_max,
-        output_format,
-    )
-
-    # Конвертируем файл в выбранный пользователем формат
-    final_output_path = convert_to_user_format(output_path, tts_voice_path, output_format)
-
-    # Удаляем временный файл
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
-    progress(1, "Готово!")
-    return tts_voice_path, final_output_path
+        # Выполняем преобразование для текущего файла
+        rvc_infer(
+            voice_model,
+            input_path,
+            output_dir,
+            index_rate,
+            pitch,
+            f0_method,
+            filter_radius,
+            volume_envelope,
+            protect,
+            hop_length,
+            f0_min,
+            f0_max,
+            output_format,
+        )
