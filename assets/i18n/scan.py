@@ -46,7 +46,7 @@ for py_file in py_files:
 print()
 print("Total unique:", len(code_keys))
 
-standard_file = "languages/en_US.json"
+standard_file = "assets/i18n/languages/en_US.json"
 with open(standard_file, "r", encoding="utf-8") as file:
     standard_data = json.load(file, object_pairs_hook=OrderedDict)
 standard_keys = set(standard_data.keys())
